@@ -1,0 +1,244 @@
+import streamlit as st
+import PyPDF2
+import re
+import pandas as pd
+import base64
+import io
+from pathlib import Path
+import datetime
+
+st.set_page_config(
+    page_title="Farmasi Calcolatore Prezzi v4",
+    page_icon="💰",
+    layout="wide"
+)
+
+# ────────────────────────────────────────────────
+#  Tema scuro / chiaro
+# ────────────────────────────────────────────────
+if "theme" not in st.session_state:
+    st.session_state.theme = "dark"  # default
+
+if st.sidebar.button("🌙 Cambia tema" if st.session_state.theme == "light" else "☀️ Cambia tema"):
+    st.session_state.theme = "light" if st.session_state.theme == "dark" else "dark"
+    st.rerun()
+
+theme_css = """
+<style>
+    .stApp { 
+        background-color: %s; 
+        color: %s;
+    }
+    .stButton>button {
+        background-color: %s;
+        color: white;
+    }
+    .stTextInput>div>div>input, .stNumberInput>div>div>input {
+        background-color: %s;
+        color: %s;
+    }
+    .stDataFrame { background-color: %s; }
+</style>
+""" % (
+    "#0E1117" if st.session_state.theme == "dark" else "#FFFFFF",
+    "#FAFAFA" if st.session_state.theme == "dark" else "#000000",
+    "#1F77B4" if st.session_state.theme == "dark" else "#0068c9",
+    "#1F2937" if st.session_state.theme == "dark" else "#F0F2F6",
+    "#E5E7EB" if st.session_state.theme == "dark" else "#000000",
+    "#111827" if st.session_state.theme == "dark" else "#FFFFFF"
+)
+
+st.markdown(theme_css, unsafe_allow_html=True)
+
+# ────────────────────────────────────────────────
+#  Funzioni di estrazione PDF (uguale alla tua logica)
+# ────────────────────────────────────────────────
+@st.cache_data(show_spinner="Estrazione prodotti dal PDF...")
+def extract_products_from_pdf(pdf_bytes):
+    products = []
+    try:
+        reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
+        for page in reader.pages:
+            text = page.extract_text() or ""
+            lines = text.split('\n')
+            for line in lines:
+                code_match = re.search(r'\b\d{7}\b', line)
+                price_match = re.search(r'\d{1,3}(?:[.,]\d{2})?\s?€', line)
+                if code_match and price_match:
+                    code = code_match.group(0)
+                    price_str = price_match.group(0)
+                    name = line.replace(code, '').replace(price_str, '').replace('|', '').strip()
+                    if len(name) < 3:
+                        name = f"Prodotto {code}"
+                    try:
+                        price = float(price_str.replace('€', '').replace(',', '.').strip())
+                        products.append({
+                            'Prodotto': name,
+                            'Codice': code,
+                            'Prezzo Pubblico': price,
+                            'Costo Reale': None           # nuovo campo
+                        })
+                    except:
+                        continue
+        df = pd.DataFrame(products).drop_duplicates(subset=['Codice']).sort_values('Codice')
+        return df
+    except Exception as e:
+        st.error(f"Errore lettura PDF: {e}")
+        return pd.DataFrame()
+
+# ────────────────────────────────────────────────
+#  Session state
+# ────────────────────────────────────────────────
+if "df_products" not in st.session_state:
+    st.session_state.df_products = None
+
+if "last_pdf_name" not in st.session_state:
+    st.session_state.last_pdf_name = None
+
+if "last_pdf_data" not in st.session_state:   # base64
+    st.session_state.last_pdf_data = None
+
+# ────────────────────────────────────────────────
+#  Sidebar – caricamento PDF
+# ────────────────────────────────────────────────
+st.sidebar.header("📄 Catalogo")
+
+uploaded_file = st.sidebar.file_uploader("Carica PDF catalogo", type=["pdf"], help="Es: CatEspaaEne2025.pdf")
+
+if uploaded_file is not None:
+    pdf_bytes = uploaded_file.read()
+    with st.spinner("Elaborazione PDF..."):
+        df_new = extract_products_from_pdf(pdf_bytes)
+        if not df_new.empty:
+            st.session_state.df_products = df_new
+            st.session_state.last_pdf_name = uploaded_file.name
+            st.session_state.last_pdf_data = base64.b64encode(pdf_bytes).decode('utf-8')
+            st.sidebar.success(f"Caricati **{len(df_new)}** prodotti")
+
+# Ripristino ultimo PDF salvato nel browser
+if st.session_state.df_products is None and st.session_state.last_pdf_data:
+    if st.sidebar.button("Ripristina ultimo catalogo usato"):
+        pdf_bytes_restored = base64.b64decode(st.session_state.last_pdf_data)
+        with st.spinner("Ripristino catalogo..."):
+            df_rest = extract_products_from_pdf(pdf_bytes_restored)
+            if not df_rest.empty:
+                st.session_state.df_products = df_rest
+                st.rerun()
+
+if st.session_state.df_products is not None:
+    st.sidebar.info(f" Catalogo attivo: **{st.session_state.last_pdf_name or 'caricato manualmente'}**")
+
+# ────────────────────────────────────────────────
+#  Main – Calcolatore
+# ────────────────────────────────────────────────
+st.title("💰 Farmasi Calcolatore Prezzi – Ricarico")
+
+if st.session_state.df_products is None or st.session_state.df_products.empty:
+    st.warning("Carica prima un file PDF con il catalogo prodotti.")
+    st.stop()
+
+df = st.session_state.df_products.copy()
+
+# Ricerca testo libero
+search_text = st.text_input("🔍 Cerca prodotto (nome o codice)", "", placeholder="es. mascara, 1234567, rossetto...")
+if search_text:
+    mask = (
+        df['Prodotto'].str.contains(search_text, case=False, na=False) |
+        df['Codice'].str.contains(search_text, case=False, na=False)
+    )
+    df = df[mask]
+
+if df.empty:
+    st.error("Nessun prodotto trovato con questo filtro.")
+    st.stop()
+
+# Selezione
+selected_prod = st.selectbox(
+    "Seleziona il prodotto",
+    options=df["Prodotto"].tolist(),
+    index=0,
+    format_func=lambda x: f"{x}  ({df[df['Prodotto']==x]['Codice'].iloc[0]})"
+)
+
+row = df[df["Prodotto"] == selected_prod].iloc[0]
+
+col1, col2 = st.columns([1,1])
+
+with col1:
+    st.subheader("Dati base")
+    st.info(f"**Codice:** {row['Codice']}")
+    prezzo_pub = st.number_input("Prezzo Pubblico (€)", value=float(row['Prezzo Pubblico']), step=0.01, format="%.2f")
+
+with col2:
+    st.subheader("Costo reale (opzionale)")
+    costo_reale = st.number_input(
+        "Costo reale pagato / stimato (€)",
+        value=float(row['Costo Reale']) if pd.notna(row['Costo Reale']) else 0.0,
+        step=0.01,
+        format="%.2f",
+        help="Se lasciato a 0, userà Prezzo Pubblico / 1.15"
+    )
+
+# Aggiorna df se cambia costo reale
+if costo_reale != row['Costo Reale']:
+    idx = df.index[df['Prodotto'] == selected_prod][0]
+    df.at[idx, 'Costo Reale'] = costo_reale if costo_reale > 0 else None
+    st.session_state.df_products = df
+
+# ── Calcoli ───────────────────────────────────────
+ricarico_perc = st.slider("Ricarico desiderato (%)", 0, 150, 30, step=5) / 100
+
+if costo_reale > 0:
+    costo_base = costo_reale
+    metodo = "Costo reale inserito manualmente"
+else:
+    costo_base = prezzo_pub / 1.15 if prezzo_pub > 0 else 0
+    metodo = "Prezzo pubblico / 1.15 (default)"
+
+profitto_euro = costo_base * ricarico_perc
+prezzo_finale = costo_base + profitto_euro
+
+st.divider()
+
+st.subheader("Risultato")
+
+c1, c2, c3 = st.columns(3)
+
+c1.metric("Costo base", f"{costo_base:.2f} €", help=metodo)
+c2.metric("Profitto", f"+ {profitto_euro:.2f} €", delta_color="normal")
+c3.metric("**Prezzo finito rivenditore**", f"{prezzo_finale:.2f} €", delta=None)
+
+st.caption(f"Calcolato con ricarico del {ricarico_perc*100:.0f}%")
+
+# ── Esportazione Excel ─────────────────────────────
+def to_excel():
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df_export = st.session_state.df_products[['Prodotto', 'Codice', 'Prezzo Pubblico', 'Costo Reale']]
+        df_export.to_excel(writer, sheet_name='Prodotti', index=False)
+        
+        ws = writer.sheets['Prodotti']
+        ws.column_dimensions['A'].width = 45
+        ws.column_dimensions['B'].width = 15
+        ws.column_dimensions['C'].width = 18
+        ws.column_dimensions['D'].width = 18
+        
+        # Formattazione prezzi
+        for row in range(2, len(df_export)+2):
+            ws[f'C{row}'].number_format = '#,##0.00 €'
+            ws[f'D{row}'].number_format = '#,##0.00 €'
+    
+    output.seek(0)
+    return output
+
+if st.button("📥 Esporta database in Excel (con costi reali)"):
+    excel_data = to_excel()
+    st.download_button(
+        label="Scarica .xlsx",
+        data=excel_data,
+        file_name=f"Farmasi_Prodotti_{datetime.date.today().strftime('%Y%m%d')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+st.markdown("---")
+st.caption("v4 • tema scuro • ricerca libera • costo manuale • esportazione • persistenza PDF locale")
